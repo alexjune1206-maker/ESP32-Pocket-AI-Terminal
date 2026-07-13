@@ -1,54 +1,276 @@
-# ESP32-Pocket-AI-Terminal
-Standalone ESP32 AI image generator using a joystick and ST7735 display.
-# ESP32 Pocket AI Terminal 📟✨
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <SPI.h>
+#include <TJpg_Decoder.h>
+#include <ArduinoJson.h>
 
-A compact, cyberpunk-style standalone terminal built on the ESP32 micro-controller. It allows users to compose text prompts using a physical analog joystick and hardware keyboard interface to generate AI digital art in real-time, completely bypassing the need for a computer.
+#define TFT_CS    5
+#define TFT_RST   4
+#define TFT_DC    2
+#define TFT_MOSI  23
+#define TFT_SCLK  18
 
-Developed by **voidpos** 🪐
+#define JOY_X     34
+#define JOY_Y     35
+#define JOY_SEL   32
 
----
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+const char* groq_api_key = "YOUR_GROQ_API_KEY";
 
-## 🚀 Features
-- **Standalone Input:** Full alphanumeric layout selectable using a standard 2-axis analog joystick.
-- **Dynamic AI Generation:** Connects directly via secure Wi-Fi (`HTTPS`) to LLM & Diffusion servers.
-- **Smart Optimization:** Translates and expands user prompts dynamically into highly descriptive English scenes using the Llama 3 model.
-- **Ultra-Fast Rendering:** Leverages the Pollinations AI Turbo model to return and display high-contrast 128x128 color graphics onto an ST7735 SPI display within seconds using hard-allocated JPEG stream decoding.
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 
----
+char alphabet[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+int alphaLength = sizeof(alphabet) - 1;
+int currentLetterIdx = 0;
+String currentPrompt = "";
 
-## 🛠️ Hardware Requirements
-| Component | Description |
-| :--- | :--- |
-| **ESP32** | NodeMCU / ESP32-WROOM-32 Development Board |
-| **ST7735 Display** | 1.44" or 1.8" SPI TFT Color Screen (128x128 or 128x160) |
-| **Joystick Module** | Standard Dual-Axis Analog Joystick with integrated Push-Button |
+unsigned long lastMoveTime = 0;
+const int moveDelay = 200;
 
----
+uint8_t* imageBuffer = NULL;
+size_t bufferSize = 0;
 
-## 🔌 Pin Configuration
-Ensure your hardware layout matches the following SPI and Analog assignments:
+bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+  if (y >= tft.height()) return false;
+  tft.drawRGBBitmap(x, y, bitmap, w, h);
+  return true;
+}
 
-### TFT Display (SPI)
-- `CS`   -> GPIO 5
-- `RST`  -> GPIO 4
-- `DC`   -> GPIO 2
-- `SDA`  -> GPIO 23 (MOSI)
-- `SCL`  -> GPIO 18 (SCLK)
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(JOY_SEL, INPUT_PULLUP);
+  
+  tft.initR_BlackTab();
+  tft.setRotation(1);
+  tft.fillScreen(ST7735_BLACK);
+  tft.setTextColor(ST7735_GREEN, ST7735_BLACK);
+  tft.setTextSize(1);
+  
+  tft.println("Connecting to WiFi...");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    tft.print(".");
+  }
+  
+  tft.fillScreen(ST7735_BLACK);
+  tft.setCursor(0, 0);
+  tft.println("WiFi Connected!");
+  delay(1000);
+  
+  TJpg_Decoder.setJpgScale(1);
+  TJpg_Decoder.setCallback(tft_output);
+  
+  updateDisplay();
+}
 
-### Joystick
-- `X-Axis` -> GPIO 34
-- `Y-Axis` -> GPIO 35
-- `Switch` -> GPIO 32 (SEL / Push-Button)
+void loop() {
+  int xVal = analogRead(JOY_X);
+  int yVal = analogRead(JOY_Y);
+  int btnSel = digitalRead(JOY_SEL);
+  
+  if (millis() - lastMoveTime > moveDelay) {
+    if (xVal < 1500) {
+      currentLetterIdx = (currentLetterIdx + 1) % alphaLength;
+      updateDisplay();
+      lastMoveTime = millis();
+    } else if (xVal > 2500) {
+      currentLetterIdx = (currentLetterIdx - 1 + alphaLength) % alphaLength;
+      updateDisplay();
+      lastMoveTime = millis();
+    }
+    
+    if (yVal < 1500) {
+      if (alphabet[currentLetterIdx] != ' ') {
+        currentPrompt += alphabet[currentLetterIdx];
+      } else if (currentPrompt.length() > 0 && currentPrompt[currentPrompt.length()-1] != ' ') {
+        currentPrompt += " ";
+      }
+      currentLetterIdx = 0;
+      updateDisplay();
+      lastMoveTime = millis();
+    } else if (yVal > 2500) {
+      if (currentPrompt.length() > 0) {
+        currentPrompt.remove(currentPrompt.length() - 1);
+        updateDisplay();
+      }
+      lastMoveTime = millis();
+    }
+  }
+  
+  if (btnSel == LOW) {
+    delay(50);
+    if (digitalRead(JOY_SEL) == LOW) {
+      currentPrompt.trim();
+      if (currentPrompt.length() > 0) {
+        processAIRequest(currentPrompt);
+        currentPrompt = "";
+        currentLetterIdx = 0;
+        updateDisplay();
+      }
+      while(digitalRead(JOY_SEL) == LOW);
+    }
+  }
+  delay(10);
+}
 
----
+void updateDisplay() {
+  tft.fillScreen(ST7735_BLACK);
+  tft.setCursor(0, 0);
+  tft.setTextColor(ST7735_GREEN);
+  tft.println("=== AI TERMINAL ===");
+  tft.println();
+  
+  tft.setTextColor(ST7735_WHITE);
+  tft.print("Prompt: ");
+  tft.println(currentPrompt);
+  tft.println();
+  
+  tft.setTextColor(ST7735_YELLOW);
+  tft.print("Char: [ ");
+  if (alphabet[currentLetterIdx] == ' ') {
+    tft.print("_");
+  } else {
+    tft.print(alphabet[currentLetterIdx]);
+  }
+  tft.println(" ]");
+  
+  tft.setTextColor(ST7735_BLUE);
+  tft.println();
+  tft.println("X: L/R Char | Y Up: Add");
+  tft.println("Y Down: Del | BTN: Send");
+}
 
-## 💻 Setup & Installation
+void processAIRequest(String prompt) {
+  tft.fillScreen(ST7735_BLACK);
+  tft.setCursor(0, 0);
+  tft.setTextColor(ST7735_MAGENTA);
+  tft.println("Optimizing prompt...");
+  
+  String EnglishPrompt = translateAndOptimize(prompt);
+  if(EnglishPrompt == "") {
+    EnglishPrompt = prompt;
+  }
+  
+  tft.fillScreen(ST7735_BLACK);
+  tft.setCursor(0, 0);
+  tft.println("Generating image...");
+  
+  String encodedPrompt = urlEncode(EnglishPrompt);
+  String imageUrl = "https://image.pollinations.ai/p/" + encodedPrompt + "?width=128&height=128&model=turbo&seed=" + String(random(1, 99999));
+  
+  downloadAndDisplayImage(imageUrl);
+}
 
-1. Clone or download this repository.
-2. Open the main `.ino` file in the Arduino IDE.
-3. Make sure you have installed the required libraries: `WiFi`, `HTTPClient`, `Adafruit_GFX`, `Adafruit_ST7735`, `TJpg_Decoder`, and `ArduinoJson`.
-4. Locate lines 20, 21, and 22 in the code and replace the placeholders with your own network and API credentials:
-   ```cpp
-   const char* ssid = "YOUR_WIFI_SSID";
-   const char* password = "YOUR_WIFI_PASSWORD";
-   const char* groq_api_key = "YOUR_GROQ_API_KEY";
+String translateAndOptimize(String text) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  
+  if (http.begin(client, "https://api.groq.com/openai/v1/chat/completions")) {
+    http.addHeader("Content-Type", "application/json");
+    String authHeader = "Bearer " + String(groq_api_key);
+    http.addHeader("Authorization", authHeader.c_str());
+    
+    StaticJsonDocument<512> doc;
+    doc["model"] = "llama3-8b-8192";
+    JsonArray messages = doc.createNestedArray("messages");
+    
+    JsonObject msg1 = messages.createNestedObject();
+    msg1["role"] = "system";
+    msg1["content"] = "Translate the user prompt to English if it is in Romanian. Expand it into a short, descriptive image prompt for a digital art style. Output ONLY the English prompt text. No quotes, no intro, no explanation.";
+    
+    JsonObject msg2 = messages.createNestedObject();
+    msg2["role"] = "user";
+    msg2["content"] = text;
+    
+    String requestBody;
+    serializeJson(doc, requestBody);
+    
+    int httpResponseCode = http.POST(requestBody);
+    if (httpResponseCode == HTTP_CODE_OK) {
+      String response = http.getString();
+      StaticJsonDocument<1024> respDoc;
+      deserializeJson(respDoc, response);
+      String result = respDoc["choices"][0]["message"]["content"].as<String>();
+      result.trim();
+      http.end();
+      return result;
+    }
+    http.end();
+  }
+  return "";
+}
+
+void downloadAndDisplayImage(String url) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  
+  if (http.begin(client, url)) {
+    int httpResponseCode = http.GET();
+    if (httpResponseCode == HTTP_CODE_OK) {
+      int contentLength = http.getSize();
+      if (contentLength > 0) {
+        if(imageBuffer != NULL) {
+          free(imageBuffer);
+          imageBuffer = NULL;
+        }
+        
+        imageBuffer = (uint8_t*)malloc(contentLength);
+        if (imageBuffer != NULL) {
+          WiFiClient* stream = http.getStreamPtr();
+          size_t bytesRead = 0;
+          while (http.connected() && bytesRead < contentLength) {
+            size_t available = stream->available();
+            if (available) {
+              int readNow = stream->readBytes(&imageBuffer[bytesRead], available);
+              bytesRead += readNow;
+            }
+            delay(1);
+          }
+          
+          tft.fillScreen(ST7735_BLACK);
+          TJpg_Decoder.drawJpg(0, 0, imageBuffer, bytesRead);
+          delay(25000);
+        }
+      }
+    } else {
+      tft.fillScreen(ST7735_BLACK);
+      tft.setCursor(0, 0);
+      tft.setTextColor(ST7735_RED);
+      tft.print("HTTP Error: ");
+      tft.println(httpResponseCode);
+      delay(3000);
+    }
+    http.end();
+  }
+  
+  if(imageBuffer != NULL) {
+    free(imageBuffer);
+    imageBuffer = NULL;
+  }
+}
+
+String urlEncode(String str) {
+  String encodedString = "";
+  char c;
+  char charBuf[5];
+  for (int i = 0; i < str.length(); i++) {
+    c = str.charAt(i);
+    if (isalnum(c)) {
+      encodedString += c;
+    } else if (c == ' ') {
+      encodedString += "%20";
+    } else {
+      sprintf(charBuf, "%%%02X", c);
+      encodedString += charBuf;
+    }
+  }
+  return encodedString;
+}
