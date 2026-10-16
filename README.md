@@ -134,7 +134,7 @@ Ensure your hardware layout matches the following SPI and Analog assignments:
 1. Clone or download this repository.
 
 
-2. Open the main `.ino` file in the Arduino IDE.
+2. Open the `main.ino` file in the Arduino IDE.
 
 
 3. Make sure you have installed the required libraries: `WiFi`, `HTTPClient`, `Adafruit_GFX`, `Adafruit_ST7735`, `TJpg_Decoder`, and `ArduinoJson`.
